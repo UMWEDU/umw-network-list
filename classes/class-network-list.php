@@ -10,6 +10,8 @@ class Network_List {
 	var $sites = array();
 	var $settings_page = 'network-list';
 	var $opt_name = '_network_list_networks';
+	var $site_transient_name = '_msnl-site-list';
+	var $transient_timeout = DAY_IN_SECONDS;
 	
 	/**
 	 * Construct the Network_List object
@@ -17,6 +19,8 @@ class Network_List {
 	function __construct() {
 		add_action( 'network_admin_menu', array( $this, 'admin_menu' ) );
 		add_action( 'admin_init', array( $this, 'admin_init' ) );
+		
+		$this->transient_timeout = apply_filters( 'msnl-transient-timeout', DAY_IN_SECONDS );
 	}
 	
 	/**
@@ -32,6 +36,7 @@ class Network_List {
 	function admin_init() {
 		register_setting( $this->settings_page, $this->opt_name, array( $this, 'sanitize_settings' ) );
 		add_settings_section( $this->settings_page, __( 'Network List Settings' ), array( $this, 'settings_section' ), $this->settings_page );
+		add_settings_section( 'multisite-network-list-site-list', __( 'Current Site List' ), array( $this, 'site_list_section' ), $this->settings_page );
 		add_settings_field( $this->opt_name, __( 'Network list:' ), array( $this, 'settings_field' ), $this->settings_page, $this->settings_page, array( 'label_for' => $this->opt_name ) );
 	}
 	
@@ -39,7 +44,7 @@ class Network_List {
 	 * Retrieve the options for this plugin
 	 */
 	function _get_options() {
-		$this->networks = get_option( $this->opt_name, array() );
+		$this->networks = get_site_option( $this->opt_name, array() );
 	}
 	
 	/**
@@ -56,6 +61,8 @@ class Network_List {
 			return false;
 		
 		$opt = $this->sanitize_settings( $opt );
+		
+		$this->invalidate_cache();
 		
 		return $this->is_multinetwork() ? update_mnetwork_option( $this->opt_name, $opt ) : update_site_option( $this->opt_name, $opt );
 	}
@@ -146,7 +153,7 @@ class Network_List {
 	protected function _no_permissions() {
 ?>
 <div class="wrap">
-	<h2><?php _e( 'Post Content Shortcodes', $this->text_domain ) ?></h2>
+	<h2><?php _e( 'Network List', $this->text_domain ) ?></h2>
 	<p><?php _e( 'You do not have the appropriate permissions to update these options. Please work with an administrator of the site to update the options. Thank you.', $this->text_domain ) ?></p>
 </div>
 <?php
@@ -171,4 +178,239 @@ class Network_List {
 		return function_exists( 'is_plugin_active_for_network' ) && is_multisite() && is_plugin_active_for_network( $this->plugin_dir_name );
 	}
 		
+	/**
+	 * Retrieve the full list of sites within the specified networks
+	 */
+	function get_site_list() {
+		if ( function_exists( 'is_multisite' ) && is_multisite() ) {
+			$sites = get_site_transient( $this->site_transient_name );
+			if ( false !== $sites )
+				return $this->sites = $sites;
+		}
+		
+		$this->_get_options();
+		if ( empty( $this->networks ) )
+			return array();
+		
+		$sites = array();
+		foreach ( $this->networks as $n ) {
+			$tmp = $this->retrieve_site_list_for_network( $n );
+			if ( is_array( $tmp ) && ! empty( $tmp ) )
+				$sites[$n] = $tmp;
+			else
+				$sites[$n] = array();
+		}
+		
+		set_site_transient( $this->site_transient_name, $sites, $this->transient_timeout );
+		
+		return $sites;
+	}
+	
+	/**
+	 * Retrieve and format a list of sites in a specific network
+	 */
+	function retrieve_site_list_for_network( $network ) {
+		$network = esc_url( $network );
+		if ( empty( $network ) )
+			return false;
+		
+		$feeds = $this->_get_feed_types();
+		if ( ! is_array( $feeds ) || empty( $feeds ) )
+			return false;
+		
+		foreach ( array_keys( $feeds ) as $f ) {
+			$url = trailingslashit( $network ) . $f;
+			
+			$result = wp_remote_get( $url );
+			if ( ! is_wp_error( $result ) && 200 === absint( wp_remote_retrieve_response_code( $result ) ) ) {
+				$type = $feeds[$f]['type'];
+				return call_user_func( apply_filters( 'multisite-network-list-parse-callback', array( $this, "_parse_feed_{$type}" ), $type ), wp_remote_retrieve_body( $result ), $feeds[$f] );
+			}
+		}
+		
+		$url = trailingslashit( $network ) . 'site-feed.json';
+		$result = wp_remote_get( $url );
+		if ( is_wp_error( $result ) || 200 !== absint( wp_remote_retrieve_response_code( $result ) ) ) {
+			$result = wp_remote_get( trailingslashit( $network ) . 'site.xml' );
+			if ( is_wp_error( $result ) || 200 !== absint( wp_remote_retrieve_response_code( $result ) ) ) {
+				return false;
+			}
+		}
+	}
+	
+	/**
+	 * Set up an array of the feeds that should be checked
+	 * The feed list is formatted as such:
+	 * 		Feed file name =>
+	 * 			'type' => the type of file being retrieved, 
+	 * 			'format' => whether the internal items in the array are arrays or objects
+	 * 			'xpath' => if this is an XML feed, provide the XPath to the individual sites
+	 * 			'parameters' => 
+	 * 				'id' => what the key name is for the element that holds the blog ID
+	 * 				'domain' => the key name or relative xpath for the element that holds the domain
+	 * 				'path' => the key name or relative xpath for the element that holds the path
+	 * 				'public' => the key name or relative xpath for the element that holds the public value
+	 */
+	function _get_feed_types() {
+		$types = array(
+			'site-feed.json' => array(
+				'type'       => 'json', 
+				'format'     => 'array', 
+				'xpath'      => false, 
+				'parameters' => array(
+					'id'     => 'blog_id', 
+					'domain' => 'domain', 
+					'path'   => 'path', 
+					'public' => 'public', 
+				),
+			), 
+			'site.xml'       => array(
+				'type'       => 'xml', 
+				'format'     => false, 
+				'xpath'      => '/urlset/url', 
+				'parameters' => array(
+					'id'     => false, 
+					'domain' => 'loc', 
+					'path'   => false, 
+					'public' => false, 
+				), 
+			)
+		);
+		
+		return apply_filters( 'multisite-network-list-feed-types', $types );
+	}
+	
+	/**
+	 * Parse a JSON feed of sites
+	 */
+	function _parse_feed_json( $body, $feed ) {
+		$body = json_decode( $body );
+		$sites = array();
+		
+		foreach ( $body as $site ) {
+			/**
+			 * If the elements are objects instead of arrays, attempt to 
+			 * 		type-cast them to arrays
+			 */
+			if ( 'object' == $feed['format'] ) {
+				$site = (array)$site;
+			}
+			
+			if ( 'array' == $feed['format'] || 'object' == $feed['format'] ) {
+				$tmp = array();
+				if ( false !== $feed['parameters']['id'] ) {
+					$k = $feed['parameters']['id'];
+					$tmp['id'] = $site[$k];
+				}
+				if ( false !== $feed['parameters']['domain'] && false !== $feed['parameters']['path'] ) {
+					$d = $feed['parameters']['domain'];
+					$p = $feed['parameters']['path'];
+					
+					if ( ! stristr( $site[$d], '://' ) ) {
+						$site[$d] = '//' . $site[$d];
+					}
+					
+					$tmp['url'] = esc_url( $site[$d] . $site[$p] );
+				} else if ( false === $feed['parameters']['path'] ) {
+					if ( ! stristr( $site[$d], '://' ) ) {
+						$site[$d] = '//' . $site[$d];
+					}
+					
+					$tmp['url'] = esc_url( $site[$d] );
+				}
+				if ( false !== $feed['parameters']['public'] ) {
+					$p = $feed['parameters']['public'];
+					$tmp['public'] = $site[$p];
+				}
+				$sites[] = $tmp;
+			}
+		}
+		
+		return $sites;
+	}
+	
+	/**
+	 * Parse an XML feed of sites
+	 */
+	function _parse_feed_xml( $body, $feed ) {
+		$sites = array();
+		
+		$xml = new SimpleXMLElement( $body );
+		$sitelist = $xml->xpath( $feed['xpath'] );
+		while ( list( , $node ) = each( $sitelist ) ) {
+			$tmp = array();
+			if ( false !== $feed['parameters']['id'] ) {
+				$i = $feed['parameters']['id'];
+				$tmp['id'] = $node->$i[0];
+			}
+			if ( false !== $feed['parameters']['domain'] && false !== $feed['parameters']['path'] ) {
+				$d = $feed['parameters']['domain'];
+				$p = $feed['parameters']['path'];
+				
+				$url = $node->$d[0];
+				if ( ! stristr( $node->$d[0], '://' ) ) {
+					$url = '//' . $node->$d[0];
+				}
+				$tmp['url'] = esc_url( trailingslashit( $url ) . $node->$p[0] );
+			} else if ( false === $feed['parameters']['path'] ) {
+				$d = $feed['parameters']['domain'];
+				$url = $node->$d[0];
+				if ( ! stristr( $node->$d[0], '://' ) ) {
+					$url = '//' . $node->$d[0];
+				}
+				$tmp['url'] = esc_url( $url );
+			}
+			if ( false !== $feed['parameters']['public'] ) {
+				$p = $feed['parameters']['public'];
+				$tmp['public'] = $node->$p[0];
+			} else {
+				$tmp['public'] = 1;
+			}
+			
+			$sites[] = $tmp;
+		}
+		
+		return $sites;
+	}
+	
+	/**
+	 * Force the deletion of the cached site list
+	 */
+	function invalidate_cache() {
+		if ( $this->is_multinetwork() && function_exists( 'delete_mnetwork_transient' ) ) {
+			delete_mnetwork_transient( $this->site_transient_name );
+		}
+		delete_site_transient( $this->site_transient_name );
+	}
+	
+	/**
+	 * Output the list of sites on the admin settings page
+	 */
+	function site_list_section() {
+		$sites = $this->get_site_list();
+?>
+<h3><?php _e( 'Current list of sites' ) ?></h3>
+<?php
+		if ( ! is_array( $sites ) || empty( $sites ) ) {
+			_e( '<p>The list of sites is currently empty.</p>' );
+			return;
+		}
+?>
+<ul>
+<?php
+		foreach ( $sites as $n => $list ) {
+			$out = '';
+			if ( is_array( $s ) && ! empty( $s ) ) {
+				$out = '<ul>';
+				foreach ( $list as $s ) {
+					$out .= sprintf( '<li>%s</li>', esc_url( $s['url'] ) );
+				}
+				$out .= '</ul>';
+			}
+			printf( '<li>%1$s%2$s</li>', esc_url( $n ), $out );
+		}
+?>
+</ul>
+<?php
+	}
 }
