@@ -44,7 +44,12 @@ class Network_List {
 	 * Retrieve the options for this plugin
 	 */
 	function _get_options() {
+		if ( $this->is_multinetwork() && function_exists( 'get_mnetwork_option' ) ) {
+			$this->networks = get_mnetwork_option( $this->opt_name, array() );
+			return $this->networks;
+		}
 		$this->networks = get_site_option( $this->opt_name, array() );
+		return $this->networks;
 	}
 	
 	/**
@@ -55,16 +60,17 @@ class Network_List {
 	 */
 	protected function _set_options( $opt ) {
 		if( ! wp_verify_nonce( $_REQUEST['_wpnonce'], $this->settings_page . '-options' ) )
-			/*wp_die( 'The nonce could not be verified' );*/
-			return false;
+			wp_die( 'The nonce could not be verified' );
+			/*return false;*/
 		if( ! is_network_admin() )
-			return false;
+			wp_die( 'This is not the network admin area' );
+			/*return false;*/
 		
 		$opt = $this->sanitize_settings( $opt );
 		
 		$this->invalidate_cache();
 		
-		return $this->is_multinetwork() ? update_mnetwork_option( $this->opt_name, $opt ) : update_site_option( $this->opt_name, $opt );
+		return $this->is_multinetwork() && function_exists( 'update_mnetwork_option' ) ? update_mnetwork_option( $this->opt_name, $opt ) : update_site_option( $this->opt_name, $opt );
 	}
 	
 	/**
@@ -139,7 +145,7 @@ class Network_List {
 	 */
 	protected function options_updated_message( $msg ) {
 ?>
-	<div class="settings-updated is-dismissible">
+	<div class="notice updated settings-updated is-dismissible">
 <?php
 			printf( __( '<p>The %s options were %supdated%s.</p>' ), $this->settings_titles[$k], ( true === $msg ? '' : '<strong>not</strong> ' ), ( true === $msg ? ' successfully' : '' ) );
 ?>
@@ -222,18 +228,12 @@ class Network_List {
 			$url = trailingslashit( $network ) . $f;
 			
 			$result = wp_remote_get( $url );
+			
 			if ( ! is_wp_error( $result ) && 200 === absint( wp_remote_retrieve_response_code( $result ) ) ) {
 				$type = $feeds[$f]['type'];
-				return call_user_func( apply_filters( 'multisite-network-list-parse-callback', array( $this, "_parse_feed_{$type}" ), $type ), wp_remote_retrieve_body( $result ), $feeds[$f] );
-			}
-		}
-		
-		$url = trailingslashit( $network ) . 'site-feed.json';
-		$result = wp_remote_get( $url );
-		if ( is_wp_error( $result ) || 200 !== absint( wp_remote_retrieve_response_code( $result ) ) ) {
-			$result = wp_remote_get( trailingslashit( $network ) . 'site.xml' );
-			if ( is_wp_error( $result ) || 200 !== absint( wp_remote_retrieve_response_code( $result ) ) ) {
-				return false;
+				$body = wp_remote_retrieve_body( $result );
+				
+				return call_user_func( apply_filters( 'multisite-network-list-parse-callback', array( $this, "_parse_feed_{$type}" ), $type ), $body, $feeds[$f] );
 			}
 		}
 	}
@@ -253,10 +253,11 @@ class Network_List {
 	 */
 	function _get_feed_types() {
 		$types = array(
-			'site-feed.json' => array(
+			'feed/site-feed.json' => array(
 				'type'       => 'json', 
 				'format'     => 'array', 
 				'xpath'      => false, 
+				'namespace'  => false, 
 				'parameters' => array(
 					'id'     => 'blog_id', 
 					'domain' => 'domain', 
@@ -267,7 +268,8 @@ class Network_List {
 			'site.xml'       => array(
 				'type'       => 'xml', 
 				'format'     => false, 
-				'xpath'      => '/urlset/url', 
+				'xpath'      => 'url', 
+				'namespace'  => 'http://www.sitemaps.org/schemas/sitemap/0.9', 
 				'parameters' => array(
 					'id'     => false, 
 					'domain' => 'loc', 
@@ -284,7 +286,8 @@ class Network_List {
 	 * Parse a JSON feed of sites
 	 */
 	function _parse_feed_json( $body, $feed ) {
-		$body = json_decode( $body );
+		$body = json_decode( $body, true );
+		
 		$sites = array();
 		
 		foreach ( $body as $site ) {
@@ -336,7 +339,58 @@ class Network_List {
 		$sites = array();
 		
 		$xml = new SimpleXMLElement( $body );
+		
+		$children = $xml->children();
+		if ( array_key_exists( $feed['xpath'], $children ) ) {
+			foreach ( $children as $child ) {
+				$tmp = array();
+				
+				if ( false !== $feed['parameters']['id'] && property_exists( $child, $feed['parameters']['id'] ) ) {
+					$tmp['id'] = absint( (string)$child->{$feed['parameters']['id']} );
+				}
+				if ( false !== $feed['parameters']['domain'] && false !== $feed['parameters']['path'] ) {
+					if ( property_exists( $child, $feed['parameters']['domain'] ) && property_exists( $child, $feed['parameters']['path'] ) ) {
+						$d = (string)$child->{$feed['parameters']['domain']};
+						$p = (string)$child->{$feed['parameters']['path']};
+						
+						$url = $d;
+						if ( ! stristr( $d, '://' ) ) {
+							$url = '//' . $d;
+						}
+						$tmp['url'] = esc_url( $url . $p );
+					}
+				} else if ( false === $feed['parameters']['path'] ) {
+					if ( property_exists( $child, $feed['parameters']['domain'] ) ) {
+						$url = (string)$child->{$feed['parameters']['domain']};
+						if ( ! stristr( $url, '://' ) ) {
+							$url = '//' . $url;
+						}
+						
+						$tmp['url'] = esc_url( $url );
+					}
+				}
+				if ( false !== $feed['parameters']['public'] && property_exists( $child, $feed['parameters']['public'] ) ) {
+					$tmp['public'] = absint( (string)$child->{$feed['parameters']['public']} );
+				} else {
+					$tmp['public'] = 1;
+				}
+				
+				$sites[] = $tmp;
+			}
+		}
+		
+		return $sites;
+		
+		if ( false !== $feed['namespace'] ) {
+			$xml->registerXPathNamespace( 'msnl', $feed['namespace'] );
+		}
+		
+		print( '<pre><code>' );
+		var_dump( $feed );
+		print( '</code></pre>' );
+		
 		$sitelist = $xml->xpath( $feed['xpath'] );
+		
 		while ( list( , $node ) = each( $sitelist ) ) {
 			$tmp = array();
 			if ( false !== $feed['parameters']['id'] ) {
@@ -388,29 +442,29 @@ class Network_List {
 	 */
 	function site_list_section() {
 		$sites = $this->get_site_list();
-?>
-<h3><?php _e( 'Current list of sites' ) ?></h3>
-<?php
+		
 		if ( ! is_array( $sites ) || empty( $sites ) ) {
 			_e( '<p>The list of sites is currently empty.</p>' );
 			return;
 		}
 ?>
-<ul>
+<ol>
 <?php
 		foreach ( $sites as $n => $list ) {
 			$out = '';
-			if ( is_array( $s ) && ! empty( $s ) ) {
-				$out = '<ul>';
+			if ( is_array( $list ) && ! empty( $list ) ) {
+				$out = '<ol>';
 				foreach ( $list as $s ) {
+					if ( '//' == substr( $s['url'], 0, 2 ) )
+						$s['url'] = 'http:' . $s['url'];
 					$out .= sprintf( '<li>%s</li>', esc_url( $s['url'] ) );
 				}
-				$out .= '</ul>';
+				$out .= '</ol>';
 			}
 			printf( '<li>%1$s%2$s</li>', esc_url( $n ), $out );
 		}
 ?>
-</ul>
+</ol>
 <?php
 	}
 }
